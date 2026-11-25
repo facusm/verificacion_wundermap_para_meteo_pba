@@ -10,6 +10,7 @@ y filtrado previo por Zona, Origen y QC Status.
 
 import json
 import datetime
+from datetime import datetime, timezone, timedelta
 import pathlib
 
 import pandas as pd
@@ -77,20 +78,23 @@ st.sidebar.title("🌦️ Meteo PBA")
 st.sidebar.markdown("### Verificación de EMAs")
 
 # ── SECCIÓN 1: PARÁMETROS DE CONSULTA (DESCARGA) ─────────────────────
+# Fecha actual en Argentina (UTC-3)
+hoy_ar = datetime.now(timezone(timedelta(hours=-3))).date()
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("📅 Rango de fechas")
 col_fi, col_ff = st.sidebar.columns(2)
 with col_fi:
     fecha_inicio = st.date_input(
         "Fecha inicio",
-        value=datetime.date.today() - datetime.timedelta(days=1),
-        max_value=datetime.date.today(),
+        value=hoy_ar,
+        max_value=hoy_ar,
     )
 with col_ff:
     fecha_fin = st.date_input(
         "Fecha fin",
-        value=datetime.date.today() - datetime.timedelta(days=1),
-        max_value=datetime.date.today(),
+        value=hoy_ar,
+        max_value=hoy_ar,
     )
 
 # Validar fechas
@@ -423,7 +427,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
                             use_container_width=True, hide_index=True,
                         )
                     else:
-                        st.info("Sin alertas de precipitación")
+                        st.info(f"No se registraron precipitaciones ≥ {umbral_pp:g} mm")
 
                 with col_v:
                     st.markdown("**Ráfagas**")
@@ -435,7 +439,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
                             use_container_width=True, hide_index=True,
                         )
                     else:
-                        st.info("Sin alertas de viento")
+                        st.info(f"No se registraron ráfagas ≥ {umbral_viento:g} km/h")
 
     # ── TAB: Precipitación ────────────────────────────────────────────
     with tab_pp:
@@ -490,7 +494,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
                 column_config=column_config,
             )
         else:
-            st.info(f"No se registraron precipitaciones sobre {umbral_pp} mm.")
+            st.info(f"No se registraron precipitaciones ≥ {umbral_pp:g} mm.")
 
     # ── TAB: Viento ───────────────────────────────────────────────────
     with tab_viento:
@@ -546,7 +550,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
                 column_config=column_config_v,
             )
         else:
-            st.info(f"No se registraron vientos sobre {umbral_viento} km/h.")
+            st.info(f"No se registraron ráfagas ≥ {umbral_viento:g} km/h.")
 
     # ── TAB: Mapa ─────────────────────────────────────────────────────
     with tab_mapa:
@@ -677,13 +681,13 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
 
                     if has_pp and has_v:
                         fill_color = "#9333ea"
-                        tipo = "🌧️💨 Lluvia + Viento"
+                        tipo = "🌧️💨 Precipitación y Viento"
                     elif has_pp:
                         fill_color = "#2563eb"
-                        tipo = "🌧️ Lluvia"
+                        tipo = "🌧️ Precipitación"
                     else:
                         fill_color = "#ea580c"
-                        tipo = "💨 Viento"
+                        tipo = "💨 Ráfagas"
 
                     qc_val = info.get("qc_status", 1)
                     qc_desc = "Aprobado" if qc_val == 1 else ("Fallo QC" if qc_val == 0 else "Sin verificar")
@@ -694,7 +698,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
                         f"<b>Zona DC:</b> {info['zona_dc']}<br>",
                         f"Origen: {info.get('origen', 'descubierta')}<br>",
                         f"QC Catálogo: {qc_val} ({qc_desc})<br>",
-                        f"Alerta: {tipo}<br>",
+                        f"Fenómeno: {tipo}<br>",
                     ]
 
                     if has_pp:
