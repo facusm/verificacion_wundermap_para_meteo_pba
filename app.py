@@ -566,11 +566,11 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
               </span>
               <span style="display: inline-flex; align-items: center; gap: 6px;">
                 <span style="display: inline-block; width: 12px; height: 12px; border-radius: 50%; background-color: #ea580c; border: 1.5px solid #ffffff; box-shadow: 0 0 0 1px #94a3b8;"></span>
-                <span><b>Viento / Ráfagas</b> (&ge; {umbral_viento:g} km/h)</span>
+                <span><b>Ráfagas</b> (&ge; {umbral_viento:g} km/h)</span>
               </span>
               <span style="display: inline-flex; align-items: center; gap: 6px;">
                 <span style="display: inline-block; width: 12px; height: 12px; border-radius: 50%; background-color: #9333ea; border: 1.5px solid #ffffff; box-shadow: 0 0 0 1px #94a3b8;"></span>
-                <span><b>Precipitación y Viento</b> (ambos umbrales)</span>
+                <span><b>Precipitación y Ráfagas</b> (ambos umbrales)</span>
               </span>
             </div>
             """,
@@ -669,7 +669,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
                 emas_viento = set(viento_detalle["Estacion"].unique()) if not viento_detalle.empty else set()
                 emas_alertas = emas_pp | emas_viento
 
-                fg_emas = folium.FeatureGroup(name="EMAs con alerta", show=True)
+                fg_emas = folium.FeatureGroup(name="EMAs sobre umbral", show=True)
 
                 for ema_id in emas_alertas:
                     if ema_id not in catalog_map:
@@ -681,7 +681,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
 
                     if has_pp and has_v:
                         fill_color = "#9333ea"
-                        tipo = "🌧️💨 Precipitación y Viento"
+                        tipo = "🌧️💨 Precipitación y Ráfagas"
                     elif has_pp:
                         fill_color = "#2563eb"
                         tipo = "🌧️ Precipitación"
