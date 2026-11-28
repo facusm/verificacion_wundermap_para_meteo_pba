@@ -184,7 +184,7 @@ def export_viento(
     ws_resumen = wb.active
     ws_resumen.title = "Resumen_por_Zona_DC"
     if not viento_resumen.empty:
-        cols_res = ["Zona DC", "Municipio", "Estacion", "Origen", "QC", "Fecha", "Rafaga_max (km/h)", "Link"]
+        cols_res = ["Zona DC", "Municipio", "Estacion", "Origen", "QC", "Fecha", "Hora_local", "Rafaga_max (km/h)", "Link"]
         df_res = viento_resumen[[c for c in cols_res if c in viento_resumen.columns]].copy()
         _df_to_sheet(ws_resumen, df_res.reset_index(drop=True))
     else:

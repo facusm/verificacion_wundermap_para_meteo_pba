@@ -28,6 +28,7 @@ from src.processing import (
     resumen_rafaga_maxima,
     resumen_por_zona,
     get_audit_info,
+    format_max_gust_line,
 )
 from src.export import export_precipitacion, export_viento
 
@@ -556,6 +557,8 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
 
         if not df_show_v.empty:
             column_config_v = {}
+            if "Hora_local" in df_show_v.columns:
+                column_config_v["Hora_local"] = st.column_config.TextColumn("Hora")
             if "Link" in df_show_v.columns:
                 column_config_v["Link"] = st.column_config.LinkColumn(
                     "Link", display_text="Ver gráfico"
@@ -724,9 +727,9 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
 
                     if has_v:
                         max_v_df = viento_resumen[viento_resumen["Estacion"] == ema_id]
-                        if not max_v_df.empty:
-                            max_v = max_v_df["Rafaga_max (km/h)"].max()
-                            popup_parts.append(f"Max ráfaga: {max_v:.1f} km/h<br>")
+                        gust_line = format_max_gust_line(max_v_df, n_dias_periodo)
+                        if gust_line:
+                            popup_parts.append(f"{gust_line}<br>")
 
                     if info.get("ajuste_costero"):
                         popup_parts.append("Ajuste costero: Sí (tolerancia marina)<br>")

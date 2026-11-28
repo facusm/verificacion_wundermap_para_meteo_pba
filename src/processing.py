@@ -226,9 +226,10 @@ def resumen_rafaga_maxima(
     umbral_kmh: float = 60.0,
 ) -> pd.DataFrame:
     """
-    Tabla resumen con la ráfaga máxima por estación, fecha y zona DC.
+    Tabla resumen con la ráfaga máxima por estación, fecha y zona DC,
+    conservando la Hora_local exacta (o 'Resumen diario') y el QC de esa fila pico.
     """
-    cols = ["Zona DC", "Municipio", "Estacion", "Fecha", "Rafaga_max (km/h)", "Origen", "QC", "Link"]
+    cols = ["Zona DC", "Municipio", "Estacion", "Fecha", "Hora_local", "Rafaga_max (km/h)", "Origen", "QC", "Link"]
     if df.empty:
         return pd.DataFrame(columns=cols)
 
@@ -260,6 +261,40 @@ def resumen_rafaga_maxima(
         key=lambda col: col.astype(str).map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
     )
     return resumen[[c for c in cols if c in resumen.columns]].reset_index(drop=True)
+
+
+def format_max_gust_line(max_v_df: pd.DataFrame, n_dias_periodo: int):
+    """
+    Formatea la línea de ráfaga máxima para el popup del mapa incluyendo fecha/hora
+    cuando el dato proviene de history/all ('HH:MM hs') o solo fecha en modo 'Resumen diario' multi-día.
+    """
+    if max_v_df.empty or "Rafaga_max (km/h)" not in max_v_df.columns:
+        return None
+    valid = max_v_df["Rafaga_max (km/h)"].dropna()
+    if valid.empty:
+        return None
+
+    idx_max = valid.idxmax()
+    max_row = max_v_df.loc[idx_max]
+    max_v = float(max_row["Rafaga_max (km/h)"])
+
+    fecha_str = str(max_row.get("Fecha", "") or "")
+    hora_str = str(max_row.get("Hora_local", "") or "").strip()
+    dd_mm = f"{fecha_str[8:10]}/{fecha_str[5:7]}" if len(fecha_str) >= 10 else fecha_str
+
+    es_hora_real = bool(hora_str) and hora_str != "Resumen diario" and hora_str.lower() != "nan"
+    if es_hora_real:
+        if n_dias_periodo == 1:
+            return f"Max ráfaga: {max_v:.1f} km/h ({hora_str} hs)"
+        return (
+            f"Max ráfaga: {max_v:.1f} km/h ({dd_mm} {hora_str} hs)"
+            if dd_mm else f"Max ráfaga: {max_v:.1f} km/h ({hora_str} hs)"
+        )
+
+    if hora_str == "Resumen diario" and n_dias_periodo > 1 and dd_mm:
+        return f"Max ráfaga: {max_v:.1f} km/h ({dd_mm})"
+
+    return f"Max ráfaga: {max_v:.1f} km/h"
 
 
 # ═══════════════════════════════════════════════════════════════════════

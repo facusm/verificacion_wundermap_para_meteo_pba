@@ -30,6 +30,7 @@ from src.processing import (
     resumen_rafaga_maxima,
     resumen_por_zona,
     get_audit_info,
+    format_max_gust_line,
 )
 from src.scraper import (
     generate_date_range,
@@ -403,18 +404,54 @@ class TestProcessing:
         result = resumen_rafaga_maxima(consolidated, umbral_kmh=60.0)
         assert not result.empty
         assert "Municipio" in result.columns
+        assert "Hora_local" in result.columns
         assert "Origen" in result.columns
         assert "QC" in result.columns
+        cols = list(result.columns)
+        assert cols.index("Hora_local") == cols.index("Fecha") + 1
 
         # TEST1 tuvo ráfaga pico de 80 km/h a las 13:00 con qcStatus=0 (fallo puntual de QC)
         row_t1 = result[result["Estacion"] == "TEST1"].iloc[0]
         assert row_t1["Rafaga_max (km/h)"] == 80.0
+        assert row_t1["Hora_local"] == "13:00"
         assert row_t1["QC"] == 0
 
-        # TEST2 tuvo ráfaga pico de 90 km/h con qcStatus=None -> fallback a catálogo qc_status=-1 (sin verificar)
+        # TEST2 tuvo ráfaga pico de 90 km/h a las 12:00 con qcStatus=None -> fallback a catálogo qc_status=-1
         row_t2 = result[result["Estacion"] == "TEST2"].iloc[0]
         assert row_t2["Rafaga_max (km/h)"] == 90.0
+        assert row_t2["Hora_local"] == "12:00"
         assert row_t2["QC"] == -1
+
+        # Caso daily ('Resumen diario')
+        df_daily = pd.DataFrame({
+            "Hora_local": ["Resumen diario"],
+            "Viento_medio (km/h)": [45.0],
+            "Rafagas (km/h)": [75.5],
+            "Precipitacion (mm)": [0.0],
+            "qcStatus": [1],
+            "Fecha": ["2026-11-26"],
+            "Estacion": ["TEST1"],
+        })
+        res_daily = resumen_rafaga_maxima(consolidate_raw_data([df_daily], sample_catalog), umbral_kmh=60.0)
+        assert res_daily.iloc[0]["Hora_local"] == "Resumen diario"
+        assert res_daily.iloc[0]["Rafaga_max (km/h)"] == pytest.approx(75.5, rel=1e-4)
+
+        # Popup formatting helper en los 4 escenarios
+        df_popup_all = pd.DataFrame({
+            "Fecha": ["2026-11-26", "2026-11-27"],
+            "Hora_local": ["14:35", "09:10"],
+            "Rafaga_max (km/h)": [75.2, 62.0],
+        })
+        assert format_max_gust_line(df_popup_all.iloc[[0]], 1) == "Max ráfaga: 75.2 km/h (14:35 hs)"
+        assert format_max_gust_line(df_popup_all, 3) == "Max ráfaga: 75.2 km/h (26/11 14:35 hs)"
+
+        df_popup_daily = pd.DataFrame({
+            "Fecha": ["2026-11-24", "2026-11-25"],
+            "Hora_local": ["Resumen diario", "Resumen diario"],
+            "Rafaga_max (km/h)": [68.4, 81.0],
+        })
+        assert format_max_gust_line(df_popup_daily.iloc[[0]], 1) == "Max ráfaga: 68.4 km/h"
+        assert format_max_gust_line(df_popup_daily, 5) == "Max ráfaga: 81.0 km/h (25/11)"
 
     def test_qc_filtering_excludes_zero_retains_minus_one_and_one(self, sample_dfs, sample_catalog):
         """
