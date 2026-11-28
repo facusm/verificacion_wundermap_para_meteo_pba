@@ -31,7 +31,14 @@ from src.processing import (
     resumen_por_zona,
     get_audit_info,
 )
-from src.scraper import generate_date_range, _build_wu_link
+from src.scraper import (
+    generate_date_range,
+    _build_wu_link,
+    _compact_station_day_records,
+    _parse_daily_observations,
+    split_date_chunks,
+    plan_scrape_strategy,
+)
 from src.export import export_precipitacion, export_viento
 
 
@@ -175,6 +182,141 @@ class TestScraper:
         assert "2026-01-15" in link
         assert "graph" in link
 
+    def test_compact_station_day_records_preserves_peaks_and_windy_rows(self):
+        # 200 registros sub-horarios de un día (la mayoría 0 mm y viento < 25 km/h)
+        records = []
+        for i in range(200):
+            hh = i // 10
+            mm = (i % 10) * 6
+            records.append({
+                "Hora_local": f"{hh:02d}:{mm:02d}",
+                "Viento_medio (km/h)": 5.0,
+                "Rafagas (km/h)": 12.0,
+                "Precipitacion (mm)": 0.0,
+                "qcStatus": 1,
+            })
+
+        # Inyectar ráfagas >= 25 km/h, pico de lluvia y pico con qcStatus=0 y qcStatus=-1
+        records[50]["Rafagas (km/h)"] = 28.0
+        records[60]["Rafagas (km/h)"] = 35.0
+        records[100]["Precipitacion (mm)"] = 18.5  # pico precip qcStatus=1
+        records[120]["Rafagas (km/h)"] = 72.0      # pico ráfaga con qcStatus=0
+        records[120]["qcStatus"] = 0
+        records[150]["Precipitacion (mm)"] = 4.0   # pico precip qcStatus=-1
+        records[150]["qcStatus"] = -1
+
+        compacted = _compact_station_day_records(records, wind_keep_threshold=25.0)
+        assert len(compacted) < 10
+        horas = [r["Hora_local"] for r in compacted]
+        # Mantiene orden cronológico
+        assert horas == sorted(horas)
+        # Conserva las ráfagas >= 25 km/h
+        assert any(r["Rafagas (km/h)"] == 28.0 for r in compacted)
+        assert any(r["Rafagas (km/h)"] == 35.0 for r in compacted)
+        # Conserva máximos por cada qcStatus
+        assert any(r["qcStatus"] == 1 and r["Precipitacion (mm)"] == 18.5 for r in compacted)
+        assert any(r["qcStatus"] == 0 and r["Rafagas (km/h)"] == 72.0 for r in compacted)
+        assert any(r["qcStatus"] == -1 and r["Precipitacion (mm)"] == 4.0 for r in compacted)
+
+    def test_compact_station_day_records_dry_calm_day_keeps_representative(self):
+        records = [
+            {
+                "Hora_local": f"{i:02d}:00",
+                "Viento_medio (km/h)": 2.0,
+                "Rafagas (km/h)": 5.0,
+                "Precipitacion (mm)": 0.0,
+                "qcStatus": 1,
+            }
+            for i in range(24)
+        ]
+        compacted = _compact_station_day_records(records, wind_keep_threshold=25.0)
+        assert len(compacted) >= 1
+        assert len(compacted) <= 2
+
+    def test_parse_daily_observations(self):
+        observations = [
+            {
+                "obsTimeLocal": "2026-11-27 23:50:00",
+                "qcStatus": 1,
+                "metric": {
+                    "precipTotal": 22.4,
+                    "windspeedHigh": 42.0,
+                    "windspeedAvg": 15.2,
+                    "windgustHigh": 64.5,
+                },
+            },
+            {
+                "obsTimeLocal": "2026-11-28 08:20:00",
+                "qcStatus": 0,
+                "metric": {
+                    "precipTotal": 0.0,
+                    "windspeedHigh": None,
+                    "windspeedAvg": 8.0,
+                    "windgustHigh": 18.0,
+                },
+            },
+        ]
+        df, sample = _parse_daily_observations(observations, "TEST_DAILY")
+        assert df is not None
+        assert len(df) == 2
+        assert list(df["Hora_local"].unique()) == ["Resumen diario"]
+        assert list(df["Fecha"]) == ["2026-11-27", "2026-11-28"]
+        assert df.iloc[0]["Precipitacion (mm)"] == 22.4
+        assert df.iloc[0]["Viento_medio (km/h)"] == 42.0
+        assert df.iloc[0]["Rafagas (km/h)"] == 64.5
+        assert df.iloc[0]["qcStatus"] == 1
+        # Fallback a windspeedAvg si windspeedHigh es None
+        assert df.iloc[1]["Viento_medio (km/h)"] == 8.0
+        assert df.iloc[1]["qcStatus"] == 0
+        assert sample is not None
+
+    def test_plan_scrape_strategy_routing_and_chunking(self):
+        hoy = datetime.date(2026, 11, 28)
+
+        # 1. Hoy + 2 días previos (26/11 al 28/11) -> 100% all
+        s1 = plan_scrape_strategy(datetime.date(2026, 11, 26), hoy, hoy_ar=hoy)
+        assert s1["mode"] == "all"
+        assert s1["all_dates"] == ["2026-11-26", "2026-11-27", "2026-11-28"]
+        assert s1["daily_chunks"] == []
+
+        # 2a. Solo ayer (27/11) -> 100% daily
+        ayer = datetime.date(2026, 11, 27)
+        s2a = plan_scrape_strategy(ayer, ayer, hoy_ar=hoy)
+        assert s2a["mode"] == "daily"
+        assert s2a["daily_chunks"] == [(ayer, ayer)]
+        assert s2a["all_dates"] == []
+
+        # 2b. Rango histórico cerrado sin hoy (01/11 al 20/11) -> 100% daily
+        s2b = plan_scrape_strategy(datetime.date(2026, 11, 1), datetime.date(2026, 11, 20), hoy_ar=hoy)
+        assert s2b["mode"] == "daily"
+        assert s2b["daily_chunks"] == [(datetime.date(2026, 11, 1), datetime.date(2026, 11, 20))]
+        assert s2b["all_dates"] == []
+
+        # 3. Hoy + 7 días previos (21/11 al 28/11)
+        s3_daily = plan_scrape_strategy(datetime.date(2026, 11, 21), hoy, hoy_ar=hoy, daily_supports_today=True)
+        assert s3_daily["mode"] == "daily"
+        assert s3_daily["daily_chunks"] == [(datetime.date(2026, 11, 21), hoy)]
+        assert s3_daily["all_dates"] == []
+
+        s3_hybrid = plan_scrape_strategy(datetime.date(2026, 11, 21), hoy, hoy_ar=hoy, daily_supports_today=False)
+        assert s3_hybrid["mode"] == "daily+hoy_all"
+        assert s3_hybrid["daily_chunks"] == [(datetime.date(2026, 11, 21), datetime.date(2026, 11, 27))]
+        assert s3_hybrid["all_dates"] == ["2026-11-28"]
+
+        # 4. Rango cerrado de 45 días -> daily en 2 bloques de <= 30 días
+        start_45 = datetime.date(2026, 10, 1)
+        end_45 = datetime.date(2026, 11, 14)
+        assert (end_45 - start_45).days + 1 == 45
+        s4 = plan_scrape_strategy(start_45, end_45, hoy_ar=hoy)
+        assert s4["mode"] == "daily"
+        assert len(s4["daily_chunks"]) == 2
+        for c_start, c_end in s4["daily_chunks"]:
+            assert (c_end - c_start).days + 1 <= 30
+        assert s4["daily_chunks"] == [
+            (datetime.date(2026, 10, 1), datetime.date(2026, 10, 30)),
+            (datetime.date(2026, 10, 31), datetime.date(2026, 11, 14)),
+        ]
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # TESTS PROCESSING
@@ -220,6 +362,13 @@ class TestProcessing:
         assert "QC" in result.columns
         assert "Link" in result.columns
         assert len(result) == 5
+
+        # Verificar downcasting de memoria
+        for col in ["Estacion", "Zona DC", "Municipio", "Origen", "Fecha"]:
+            assert isinstance(result[col].dtype, pd.CategoricalDtype), f"{col} debe ser category"
+        for col in ["Viento_medio (km/h)", "Rafagas (km/h)", "Precipitacion (mm)"]:
+            assert str(result[col].dtype) == "float32", f"{col} debe ser float32"
+        assert str(result["QC"].dtype) == "Int8"
 
     def test_verificacion_pp_diaria(self, sample_dfs, sample_catalog):
         consolidated = consolidate_raw_data(sample_dfs, sample_catalog)

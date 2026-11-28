@@ -8,6 +8,7 @@ Zona de Defensa Civil (I–XII), con soporte para catálogo completo
 y filtrado previo por Zona, Origen y QC Status.
 """
 
+import gc
 import json
 import datetime
 from datetime import datetime, timezone, timedelta
@@ -18,7 +19,7 @@ import streamlit as st
 
 from src.geo import ZONA_ORDER, load_zonas_simple
 from src.stations import load_catalog, build_catalog, catalog_summary, BASE_STATIONS
-from src.scraper import scrape_stations, generate_date_range
+from src.scraper import scrape_date_range, plan_scrape_strategy, generate_date_range
 from src.processing import (
     consolidate_raw_data,
     verificacion_precipitacion_diaria,
@@ -51,15 +52,16 @@ def cached_load_catalog():
     return load_catalog(DATA_DIR)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def cached_scrape(station_ids_tuple, fechas_tuple):
+@st.cache_data(ttl=900, max_entries=1, show_spinner=False)
+def cached_scrape(station_ids_tuple, fecha_inicio, fecha_fin):
     """
-    Ejecuta scraping con caché.
-    TTL 15 min (incluye fecha actual) / tupla para hashability.
+    Ejecuta scraping con caché (max_entries=1 para liberar RAM en Streamlit Cloud).
+    TTL 15 min / tupla de station_ids para hashability.
     """
-    dfs, metrics = scrape_stations(
+    dfs, metrics = scrape_date_range(
         list(station_ids_tuple),
-        list(fechas_tuple),
+        fecha_inicio,
+        fecha_fin,
     )
     return dfs, metrics
 
@@ -103,7 +105,18 @@ if fecha_inicio > fecha_fin:
     st.stop()
 
 n_dias = (fecha_fin - fecha_inicio).days + 1
-if n_dias > 7:
+strategy = plan_scrape_strategy(fecha_inicio, fecha_fin, hoy_ar=hoy_ar)
+
+if strategy["mode"] == "all":
+    st.sidebar.caption("⚡ Modo detalle (incluye hoy y ≤ 3 días previos): incluye hora exacta de ráfagas.")
+elif not strategy["contiene_hoy"]:
+    st.sidebar.caption("📅 Modo resumen diario (días cerrados): consulta rápida por bloques de hasta 30 días (sin hora exacta de ráfagas).")
+elif strategy["mode"] == "daily":
+    st.sidebar.caption("📅 Modo resumen diario (rango largo): consulta rápida por bloques de hasta 30 días incluyendo el día en curso (sin hora exacta de ráfagas).")
+else:
+    st.sidebar.caption("📅 Modo resumen diario (rango largo): consulta rápida por bloques de hasta 30 días para días cerrados; hoy se consulta en detalle.")
+
+if n_dias > 60:
     st.sidebar.warning(
         f"⚠️ Rango de {n_dias} días. La consulta puede tardar varios minutos."
     )
@@ -128,7 +141,7 @@ st.sidebar.markdown("---")
 ejecutar = st.sidebar.button(
     "🚀 Ejecutar verificación",
     type="primary",
-    use_container_width=True,
+    width="stretch",
 )
 
 # ── SECCIÓN 2: FILTROS REACTIVOS EN MEMORIA (TIEMPO REAL) ─────────────
@@ -162,7 +175,7 @@ st.sidebar.markdown("---")
 with st.sidebar.expander("📋 Catálogo de EMAs PBA"):
     if catalog:
         summary = catalog_summary(catalog)
-        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.dataframe(summary, width="stretch", hide_index=True)
         tot_b = sum(1 for s in catalog if s.get("origen") == "base_verificada")
         tot_d = sum(1 for s in catalog if s.get("origen") == "descubierta")
         st.caption(f"Total: {len(catalog)} estaciones (Base: {tot_b} | Descubiertas: {tot_d})")
@@ -225,24 +238,25 @@ if ejecutar:
         st.warning("No hay estaciones que cumplan los filtros seleccionados.")
         st.stop()
 
+    # Liberar corrida anterior antes de ejecutar la nueva descarga
+    if "df_raw" in st.session_state:
+        del st.session_state["df_raw"]
+    gc.collect()
+
     # ─── Scraping ─────────────────────────────────────────────────────
     progress_bar = st.progress(0, text=f"Consultando {len(station_ids)} estaciones...")
 
-    total_tasks = len(station_ids) * len(fechas)
-
-    def update_progress(current, total, sid, fecha, status):
-        pct = current / total
-        progress_bar.progress(pct, text=f"[{current}/{total}] {sid} — {fecha}")
-
-    with st.spinner(f"Consultando {len(station_ids)} EMAs para {len(fechas)} día(s)..."):
+    with st.spinner(f"Consultando {len(station_ids)} EMAs para {n_dias} día(s) (modo {strategy['mode']})..."):
         dfs, metrics = cached_scrape(
-            tuple(station_ids), tuple(fechas)
+            tuple(station_ids), fecha_inicio, fecha_fin
         )
 
     progress_bar.progress(1.0, text=f"✅ Consulta completada ({metrics.ok} exitosas, {metrics.sin_datos} sin datos)")
 
     # ─── Consolidación de datos crudos (sin filtrar por umbrales ni QC) ──
     df_raw = consolidate_raw_data(dfs, catalog)
+    del dfs
+    gc.collect()
 
     # Guardar estado crudo en session_state
     st.session_state["df_raw"] = df_raw
@@ -253,6 +267,7 @@ if ejecutar:
         "fecha_inicio": fecha_inicio,
         "fecha_fin": fecha_fin,
         "zonas_consultadas": set(zonas_seleccionadas),
+        "scrape_mode": metrics.mode,
     }
 
 
@@ -399,7 +414,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
         st.subheader("Vista por Zona de Defensa Civil")
 
         st.markdown("#### Resumen comparativo de máximos por Zona DC")
-        st.dataframe(resumen_zonas_view, use_container_width=True, hide_index=True)
+        st.dataframe(resumen_zonas_view, width="stretch", hide_index=True)
 
         st.markdown("---")
 
@@ -424,7 +439,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
                         cols_show_p = [c for c in ["Municipio", "Estacion", "Origen", "QC", "Fecha", "Precipitacion (mm)"] if c in zona_pp.columns]
                         st.dataframe(
                             zona_pp[cols_show_p],
-                            use_container_width=True, hide_index=True,
+                            width="stretch", hide_index=True,
                         )
                     else:
                         st.info(f"No se registraron precipitaciones ≥ {umbral_pp:g} mm")
@@ -436,7 +451,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
                         cols_show_v = [c for c in ["Municipio", "Estacion", "Origen", "QC", "Fecha", "Rafaga_max (km/h)"] if c in zona_v.columns]
                         st.dataframe(
                             zona_v[cols_show_v],
-                            use_container_width=True, hide_index=True,
+                            width="stretch", hide_index=True,
                         )
                     else:
                         st.info(f"No se registraron ráfagas ≥ {umbral_viento:g} km/h")
@@ -489,7 +504,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
                 )
             st.dataframe(
                 df_show,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config=column_config,
             )
@@ -499,6 +514,8 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
     # ── TAB: Viento ───────────────────────────────────────────────────
     with tab_viento:
         st.subheader("💨 Viento y Ráfagas")
+        if meta.get("scrape_mode") in ("daily", "daily+hoy_all"):
+            st.caption("📅 Los días consultados en modo resumen diario muestran el máximo del día (`Resumen diario`, sin hora exacta).")
 
         vista_viento = st.radio(
             "Vista",
@@ -545,7 +562,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
                 )
             st.dataframe(
                 df_show_v,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config=column_config_v,
             )
@@ -752,7 +769,7 @@ if "df_raw" in st.session_state and st.session_state["df_raw"] is not None:
 
         if not audit_df.empty:
             st.markdown("#### Estaciones sin datos")
-            st.dataframe(audit_df, use_container_width=True, hide_index=True)
+            st.dataframe(audit_df, width="stretch", hide_index=True)
         else:
             st.success("Todas las estaciones del universo seleccionado devolvieron datos.")
 

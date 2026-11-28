@@ -9,7 +9,7 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -31,6 +31,12 @@ HEADERS = {
 }
 
 WU_API_BASE = "https://api.weather.com/v2/pws/history/all"
+WU_API_DAILY_BASE = "https://api.weather.com/v2/pws/history/daily"
+
+MAX_PREVIOUS_DAYS_FOR_ALL = 3
+DAILY_CHUNK_DAYS = 30
+WIND_KEEP_THRESHOLD_KMH = 25.0
+TZ_AR = timezone(timedelta(hours=-3))
 
 MAX_WORKERS = 12
 TIMEOUT = 20
@@ -40,12 +46,12 @@ BACKOFF_BASE = 1.5  # segundos
 
 @dataclass
 class ScrapeResult:
-    """Resultado del scraping de una estación para una fecha."""
+    """Resultado del scraping de una estación para una fecha o bloque."""
     station_id: str
     fecha: str
     status: str  # "ok", "sin_datos", "error"
     df: Optional[pd.DataFrame] = None
-    source_method: str = ""  # "api_json" o "html_fallback"
+    source_method: str = ""  # "api_json", "api_daily", o "html_fallback"
     error_msg: str = ""
     raw_sample: Optional[dict] = None
 
@@ -58,7 +64,9 @@ class RunMetrics:
     sin_datos: int = 0
     errores: int = 0
     metodo_api: int = 0
+    metodo_daily: int = 0
     metodo_html: int = 0
+    mode: str = "all"
     detalle_errores: list = field(default_factory=list)
 
 
@@ -68,6 +76,73 @@ def _build_wu_link(station_id: str, fecha: str) -> str:
         f"https://www.wunderground.com/dashboard/pws/{station_id}"
         f"/graph/{fecha}/{fecha}/daily"
     )
+
+
+def _compact_station_day_records(
+    records: list[dict],
+    wind_keep_threshold: float = WIND_KEEP_THRESHOLD_KMH,
+) -> list[dict]:
+    """
+    Compacta observaciones sub-horarias de un día de una estación conservando:
+    - Por cada qcStatus presente (1, 0, -1, None): el registro con mayor
+      precipitación y el registro con mayor ráfaga/viento.
+    - Todas las observaciones individuales donde ráfaga o viento >= wind_keep_threshold.
+    - Al menos 1 registro representativo en días secos/calmos.
+    Elimina duplicados y conserva el orden cronológico original.
+    """
+    if not records:
+        return []
+
+    keep_indices: set[int] = set()
+    by_qc: dict = {}
+
+    for idx, rec in enumerate(records):
+        qc = rec.get("qcStatus")
+        by_qc.setdefault(qc, []).append((idx, rec))
+
+        gust = rec.get("Rafagas (km/h)")
+        wind = rec.get("Viento_medio (km/h)")
+        if wind is None:
+            wind = rec.get("Viento (km/h)")
+
+        if (gust is not None and gust >= wind_keep_threshold) or (
+            wind is not None and wind >= wind_keep_threshold
+        ):
+            keep_indices.add(idx)
+
+    for qc_group in by_qc.values():
+        # Máximo de precipitación del grupo qcStatus
+        best_pp_idx = max(
+            qc_group,
+            key=lambda item: (
+                item[1].get("Precipitacion (mm)")
+                if item[1].get("Precipitacion (mm)") is not None
+                else float("-inf"),
+                -item[0],
+            ),
+        )[0]
+        keep_indices.add(best_pp_idx)
+
+        # Máximo de ráfaga / viento del grupo qcStatus
+        def _wind_score(item):
+            rec = item[1]
+            gust = rec.get("Rafagas (km/h)")
+            wind = rec.get("Viento_medio (km/h)")
+            if wind is None:
+                wind = rec.get("Viento (km/h)")
+            return (
+                gust if gust is not None else float("-inf"),
+                wind if wind is not None else float("-inf"),
+                -item[0],
+            )
+
+        best_wind_idx = max(qc_group, key=_wind_score)[0]
+        keep_indices.add(best_wind_idx)
+
+    if not keep_indices:
+        keep_indices.add(0)
+
+    return [records[i] for i in sorted(keep_indices)]
 
 
 def _fetch_via_api(station_id: str, fecha: str) -> Tuple[Optional[pd.DataFrame], Optional[dict]]:
@@ -149,10 +224,118 @@ def _fetch_via_api(station_id: str, fecha: str) -> Tuple[Optional[pd.DataFrame],
     if not rows:
         return None, None
 
+    rows = _compact_station_day_records(rows)
     df = pd.DataFrame(rows)
     df["Fecha"] = fecha
     df["Estacion"] = station_id
     return df, raw_sample
+
+
+def _parse_daily_observations(
+    observations: list[dict],
+    station_id: str,
+) -> Tuple[Optional[pd.DataFrame], Optional[dict]]:
+    """
+    Normaliza observaciones de /v2/pws/history/daily al mismo esquema que history/all.
+    """
+    if not observations:
+        return None, None
+
+    rows = []
+    raw_sample = None
+
+    for obs in observations:
+        metric = obs.get("metric") or {}
+        obs_time = obs.get("obsTimeLocal", "") or ""
+        fecha_str = ""
+        if len(obs_time) >= 10 and obs_time[4] == "-" and obs_time[7] == "-":
+            fecha_str = obs_time[:10]
+        else:
+            try:
+                fecha_str = datetime.fromisoformat(obs_time.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                continue
+
+        precip = metric.get("precipTotal")
+        wind_gust = metric.get("windgustHigh")
+        wind_speed = metric.get("windspeedHigh")
+        if wind_speed is None:
+            wind_speed = metric.get("windspeedAvg")
+        qc_status = obs.get("qcStatus")
+
+        if raw_sample is None and (precip is not None or wind_speed is not None or wind_gust is not None):
+            raw_sample = {
+                "source": "api_daily (units=m)",
+                "obsTimeLocal": obs_time,
+                "raw_precipTotal_mm": precip,
+                "raw_windspeedHigh_kmh": wind_speed,
+                "raw_windgustHigh_kmh": wind_gust,
+                "qcStatus": qc_status,
+            }
+
+        rows.append({
+            "Hora_local": "Resumen diario",
+            "Viento_medio (km/h)": round(float(wind_speed), 2) if wind_speed is not None else None,
+            "Rafagas (km/h)": round(float(wind_gust), 2) if wind_gust is not None else None,
+            "Precipitacion (mm)": round(float(precip), 2) if precip is not None else None,
+            "qcStatus": int(qc_status) if qc_status is not None else None,
+            "Fecha": fecha_str,
+            "Estacion": station_id,
+        })
+
+    if not rows:
+        return None, None
+
+    df = pd.DataFrame(rows)
+    return df, raw_sample
+
+
+def _fetch_via_daily_api(
+    station_id: str,
+    start_date: date,
+    end_date: date,
+) -> Tuple[Optional[pd.DataFrame], Optional[dict], bool]:
+    """
+    Obtiene datos diarios resumidos vía /v2/pws/history/daily (bloques <= 30 días).
+    Returns:
+        (DataFrame | None, raw_sample | None, transient_error: bool)
+    """
+    api_key = get_wu_api_key()
+    params = {
+        "stationId": station_id,
+        "format": "json",
+        "units": "m",
+        "startDate": start_date.strftime("%Y%m%d"),
+        "endDate": end_date.strftime("%Y%m%d"),
+        "numericPrecision": "decimal",
+        "apiKey": api_key,
+    }
+
+    try:
+        resp = requests.get(
+            WU_API_DAILY_BASE, params=params, headers=HEADERS, timeout=TIMEOUT
+        )
+        if resp.status_code == 401:
+            api_key = get_wu_api_key(force_refresh=True)
+            params["apiKey"] = api_key
+            resp = requests.get(
+                WU_API_DAILY_BASE, params=params, headers=HEADERS, timeout=TIMEOUT
+            )
+
+        if resp.status_code == 204:
+            return None, None, False
+
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None, None, True
+
+    observations = data.get("observations")
+    if not observations:
+        return None, None, False
+
+    df, raw_sample = _parse_daily_observations(observations, station_id)
+    return df, raw_sample, False
 
 
 def _fetch_via_html(station_id: str, fecha: str) -> Tuple[Optional[pd.DataFrame], Optional[dict]]:
@@ -287,6 +470,185 @@ def fetch_station_day(station_id: str, fecha: str) -> ScrapeResult:
         status="sin_datos",
         error_msg="No se obtuvieron registros para la fecha consultada.",
     )
+
+
+def fetch_station_daily(
+    station_id: str,
+    start_date: date,
+    end_date: date,
+) -> ScrapeResult:
+    """Obtiene datos de un bloque de fechas (<= 30 días) vía history/daily con reintentos."""
+    import time
+
+    label = f"{start_date.strftime('%Y-%m-%d')}..{end_date.strftime('%Y-%m-%d')}"
+    for attempt in range(MAX_RETRIES):
+        df, raw_sample, transient_error = _fetch_via_daily_api(station_id, start_date, end_date)
+        if df is not None and not df.empty:
+            return ScrapeResult(
+                station_id=station_id,
+                fecha=label,
+                status="ok",
+                df=df,
+                source_method="api_daily",
+                raw_sample=raw_sample,
+            )
+        if not transient_error:
+            break
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(BACKOFF_BASE ** (attempt + 1))
+
+    return ScrapeResult(
+        station_id=station_id,
+        fecha=label,
+        status="sin_datos",
+        error_msg="No se obtuvieron registros diarios para el rango consultado.",
+    )
+
+
+def split_date_chunks(
+    fecha_inicio: date,
+    fecha_fin: date,
+    chunk_days: int = DAILY_CHUNK_DAYS,
+) -> list[tuple[date, date]]:
+    """Divide [fecha_inicio, fecha_fin] en bloques inclusivos de hasta chunk_days días."""
+    if fecha_inicio > fecha_fin:
+        return []
+    chunks = []
+    current = fecha_inicio
+    while current <= fecha_fin:
+        chunk_end = min(fecha_fin, current + timedelta(days=chunk_days - 1))
+        chunks.append((current, chunk_end))
+        current = chunk_end + timedelta(days=1)
+    return chunks
+
+
+def plan_scrape_strategy(
+    fecha_inicio: date,
+    fecha_fin: date,
+    hoy_ar: Optional[date] = None,
+    max_previous_days_for_all: int = MAX_PREVIOUS_DAYS_FOR_ALL,
+    daily_supports_today: bool = True,
+) -> dict:
+    """
+    Determina dinámicamente la estrategia de extracción entre history/all y history/daily.
+
+    Reglas:
+    - Caso 1 (all): incluye hoy y dias_previos <= MAX_PREVIOUS_DAYS_FOR_ALL (<= 3) -> history/all compactado.
+    - Caso 2 (daily): no incluye hoy -> history/daily en bloques <= 30 días.
+    - Caso 3 (rango largo con hoy): incluye hoy y dias_previos > MAX_PREVIOUS_DAYS_FOR_ALL ->
+      usa history/daily en bloques <= 30 días (incluyendo hoy si daily_supports_today=True,
+      o 'daily+hoy_all' consultando solo hoy_ar con history/all si daily_supports_today=False).
+    """
+    if hoy_ar is None:
+        hoy_ar = datetime.now(TZ_AR).date()
+
+    contiene_hoy = fecha_inicio <= hoy_ar <= fecha_fin
+    dias_previos = (hoy_ar - fecha_inicio).days
+
+    if contiene_hoy and dias_previos <= max_previous_days_for_all:
+        return {
+            "mode": "all",
+            "daily_chunks": [],
+            "all_dates": generate_date_range(fecha_inicio, fecha_fin),
+            "contiene_hoy": contiene_hoy,
+            "dias_previos": dias_previos,
+        }
+
+    if not contiene_hoy:
+        return {
+            "mode": "daily",
+            "daily_chunks": split_date_chunks(fecha_inicio, fecha_fin, DAILY_CHUNK_DAYS),
+            "all_dates": [],
+            "contiene_hoy": contiene_hoy,
+            "dias_previos": dias_previos,
+        }
+
+    # Caso 3: contiene hoy y dias_previos > max_previous_days_for_all
+    if daily_supports_today:
+        return {
+            "mode": "daily",
+            "daily_chunks": split_date_chunks(fecha_inicio, fecha_fin, DAILY_CHUNK_DAYS),
+            "all_dates": [],
+            "contiene_hoy": contiene_hoy,
+            "dias_previos": dias_previos,
+        }
+
+    closed_end = hoy_ar - timedelta(days=1)
+    daily_chunks = split_date_chunks(fecha_inicio, closed_end, DAILY_CHUNK_DAYS) if fecha_inicio <= closed_end else []
+    return {
+        "mode": "daily+hoy_all",
+        "daily_chunks": daily_chunks,
+        "all_dates": [hoy_ar.strftime("%Y-%m-%d")],
+        "contiene_hoy": contiene_hoy,
+        "dias_previos": dias_previos,
+    }
+
+
+def scrape_date_range(
+    station_ids: list[str],
+    fecha_inicio: date,
+    fecha_fin: date,
+    max_workers: int = MAX_WORKERS,
+    progress_callback=None,
+    hoy_ar: Optional[date] = None,
+) -> tuple[list[pd.DataFrame], RunMetrics]:
+    """
+    Ejecuta el scraping concurrente eligiendo dinámicamente history/all o history/daily.
+    """
+    strategy = plan_scrape_strategy(fecha_inicio, fecha_fin, hoy_ar=hoy_ar)
+    metrics = RunMetrics(mode=strategy["mode"])
+    all_dfs = []
+
+    tasks = []
+    for sid in station_ids:
+        for chunk_start, chunk_end in strategy["daily_chunks"]:
+            tasks.append(("daily", sid, chunk_start, chunk_end))
+        for f in strategy["all_dates"]:
+            tasks.append(("all", sid, f, None))
+
+    metrics.total = len(tasks)
+    if not tasks:
+        return all_dfs, metrics
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for kind, sid, arg1, arg2 in tasks:
+            if kind == "daily":
+                fut = executor.submit(fetch_station_daily, sid, arg1, arg2)
+                label = f"{arg1.strftime('%Y-%m-%d')}..{arg2.strftime('%Y-%m-%d')}"
+            else:
+                fut = executor.submit(fetch_station_day, sid, arg1)
+                label = arg1
+            futures[fut] = (sid, label)
+
+        for i, future in enumerate(as_completed(futures)):
+            sid, label = futures[future]
+            status = "error"
+            try:
+                result = future.result()
+                status = result.status
+                if result.status == "ok" and result.df is not None:
+                    metrics.ok += 1
+                    if result.source_method == "api_daily":
+                        metrics.metodo_daily += 1
+                    elif result.source_method == "api_json":
+                        metrics.metodo_api += 1
+                    else:
+                        metrics.metodo_html += 1
+                    all_dfs.append(result.df)
+                elif result.status == "sin_datos":
+                    metrics.sin_datos += 1
+                else:
+                    metrics.errores += 1
+                    metrics.detalle_errores.append(f"{sid}/{label}: {result.error_msg}")
+            except Exception as e:
+                metrics.errores += 1
+                metrics.detalle_errores.append(f"{sid}/{label}: {str(e)}")
+
+            if progress_callback:
+                progress_callback(i + 1, metrics.total, sid, label, status)
+
+    return all_dfs, metrics
 
 
 def scrape_stations(

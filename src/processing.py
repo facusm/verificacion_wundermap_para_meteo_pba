@@ -17,7 +17,7 @@ def _sort_by_zona(df: pd.DataFrame, zona_col: str = "Zona DC") -> pd.DataFrame:
         return df
     order_map = {z: i for i, z in enumerate(ZONA_ORDER)}
     df = df.copy()
-    df["_zona_order"] = df[zona_col].map(order_map)
+    df["_zona_order"] = df[zona_col].astype(str).map(order_map)
     df.sort_values("_zona_order", inplace=True)
     df.drop(columns="_zona_order", inplace=True)
     return df.reset_index(drop=True)
@@ -28,8 +28,9 @@ def consolidate_raw_data(
     catalog: list[dict],
 ) -> pd.DataFrame:
     """
-    Consolida los DataFrames crudos del scraping y les agrega
-    la información de Zona DC, Origen y QC desde el catálogo.
+    Consolida los DataFrames crudos del scraping, les agrega la información de
+    Zona DC, Municipio, Origen y QC desde el catálogo, y realiza downcasting
+    de tipos (category, float32, Int8) para minimizar uso de RAM.
     """
     if not dfs:
         return _empty_consolidated()
@@ -50,19 +51,25 @@ def consolidate_raw_data(
     catalog_qc = df["Estacion"].map(qc_map)
     if "qcStatus" in df.columns:
         merged_qc = df["qcStatus"].combine_first(catalog_qc)
-        df["QC"] = pd.to_numeric(merged_qc, errors="coerce").fillna(1).astype(int)
+        df["QC"] = pd.to_numeric(merged_qc, errors="coerce").fillna(1).astype("Int8")
+        df.drop(columns=["qcStatus"], inplace=True)
     else:
-        df["QC"] = pd.to_numeric(catalog_qc, errors="coerce").fillna(1).astype(int)
+        df["QC"] = pd.to_numeric(catalog_qc, errors="coerce").fillna(1).astype("Int8")
 
-    # Agregar link
+    # Agregar link antes de convertir Estacion/Fecha a category
     df["Link"] = df.apply(
-        lambda row: _build_wu_link(row["Estacion"], row["Fecha"]), axis=1
+        lambda row: _build_wu_link(str(row["Estacion"]), str(row["Fecha"])), axis=1
     )
 
-    # Asegurar tipos numéricos
+    # Downcasting numérico (float32)
     for col in ["Viento_medio (km/h)", "Rafagas (km/h)", "Precipitacion (mm)"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+
+    # Downcasting categórico en columnas de baja cardinalidad
+    for col in ["Estacion", "Zona DC", "Municipio", "Origen", "Fecha"]:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
 
     return df
 
@@ -116,7 +123,7 @@ def verificacion_precipitacion_diaria(
         ["Zona DC", "Fecha", "Precipitacion (mm)"],
         ascending=[True, True, False],
         inplace=True,
-        key=lambda col: col.map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
+        key=lambda col: col.astype(str).map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
     )
     return over.reset_index(drop=True)
 
@@ -150,7 +157,7 @@ def verificacion_precipitacion_acumulada(
         return 1
 
     acum = (
-        daily.groupby("Estacion")
+        daily.groupby("Estacion", observed=True)
         .agg({
             "Precipitacion (mm)": "sum",
             "Zona DC": "first",
@@ -175,7 +182,7 @@ def verificacion_precipitacion_acumulada(
         ["Zona DC", "Precipitacion (mm)"],
         ascending=[True, False],
         inplace=True,
-        key=lambda col: col.map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
+        key=lambda col: col.astype(str).map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
     )
     return over.reset_index(drop=True)
 
@@ -250,7 +257,7 @@ def resumen_rafaga_maxima(
         ["Zona DC", "Rafaga_max (km/h)"],
         ascending=[True, False],
         inplace=True,
-        key=lambda col: col.map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
+        key=lambda col: col.astype(str).map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
     )
     return resumen[[c for c in cols if c in resumen.columns]].reset_index(drop=True)
 
@@ -268,7 +275,7 @@ def resumen_por_zona(
     """
     if not pp_diaria.empty and "Zona DC" in pp_diaria.columns:
         pp_zona = (
-            pp_diaria.groupby("Zona DC")
+            pp_diaria.groupby("Zona DC", observed=True)
             .agg({
                 "Precipitacion (mm)": "max",
                 "Estacion": "nunique",
@@ -279,13 +286,14 @@ def resumen_por_zona(
                 "Estacion": "EMAs_con_precip",
             })
         )
+        pp_zona["Zona DC"] = pp_zona["Zona DC"].astype(str)
     else:
         pp_zona = pd.DataFrame(columns=["Zona DC", "Max_Precip (mm)", "EMAs_con_precip"])
 
     if not viento_resumen.empty and "Zona DC" in viento_resumen.columns:
         rafaga_col = "Rafaga_max (km/h)" if "Rafaga_max (km/h)" in viento_resumen.columns else "Rafagas (km/h)"
         viento_zona = (
-            viento_resumen.groupby("Zona DC")
+            viento_resumen.groupby("Zona DC", observed=True)
             .agg({
                 rafaga_col: "max",
                 "Estacion": "nunique",
@@ -296,6 +304,7 @@ def resumen_por_zona(
                 "Estacion": "EMAs_con_viento",
             })
         )
+        viento_zona["Zona DC"] = viento_zona["Zona DC"].astype(str)
     else:
         viento_zona = pd.DataFrame(columns=["Zona DC", "Max_Rafaga (km/h)", "EMAs_con_viento"])
 

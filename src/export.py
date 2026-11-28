@@ -128,7 +128,7 @@ def export_precipitacion(
             df_fecha.sort_values(
                 ["Zona DC", "Precipitacion (mm)"],
                 ascending=[True, False],
-                key=lambda col: col.map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
+                key=lambda col: col.astype(str).map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
                 inplace=True,
             )
             sheet_name = str(fecha)[:31]
@@ -199,7 +199,7 @@ def export_viento(
             df_fecha.sort_values(
                 ["Zona DC", "Rafagas (km/h)"],
                 ascending=[True, False],
-                key=lambda col: col.map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
+                key=lambda col: col.astype(str).map({z: i for i, z in enumerate(ZONA_ORDER)}) if col.name == "Zona DC" else col,
                 inplace=True,
             )
             sheet_name = str(fecha)[:31]
